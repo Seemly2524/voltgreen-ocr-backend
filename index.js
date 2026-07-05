@@ -1,7 +1,6 @@
 import express from 'express';
 import multer from 'multer';
 import cors from 'cors';
-import { GoogleAuth } from 'google-auth-library';
 
 const app = express();
 app.use(cors());
@@ -9,78 +8,6 @@ app.use(cors());
 const upload = multer({ storage: multer.memoryStorage() });
 
 const VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
-
-let getAccessToken;
-
-async function initAuth() {
-  const credsJson = process.env.GOOGLE_CREDENTIALS_JSON;
-  if (credsJson) {
-    try {
-      const creds = JSON.parse(credsJson);
-      const auth = new GoogleAuth({
-        credentials: creds,
-        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-      });
-      const client = await auth.getClient();
-      getAccessToken = async () => {
-        const token = await client.getAccessToken();
-        return token.token;
-      };
-      console.log('Autenticado con cuenta de servicio');
-      return;
-    } catch (e) {
-      console.error('Error al inicializar auth:', e.message);
-    }
-  }
-
-  const API_KEY = process.env.VISION_API_KEY;
-  if (API_KEY) {
-    getAccessToken = async () => null;
-    console.log('Usando API key como respaldo');
-    return;
-  }
-
-  throw new Error('No hay credenciales configuradas (GOOGLE_CREDENTIALS_JSON o VISION_API_KEY)');
-}
-
-await initAuth();
-
-async function ocrTextFromBuffer(buf) {
-  const base64 = buf.toString('base64');
-  const body = {
-    requests: [{
-      image: { content: base64 },
-      features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
-    }],
-  };
-
-  const token = await getAccessToken();
-  const headers = { 'Content-Type': 'application/json' };
-
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-    var url = VISION_URL;
-  } else {
-    const API_KEY = process.env.VISION_API_KEY;
-    url = `${VISION_URL}?key=${API_KEY}`;
-  }
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Vision API error (${res.status}): ${err}`);
-  }
-
-  const json = await res.json();
-  const text = json.responses?.[0]?.fullTextAnnotation?.text ?? '';
-  if (json.responses?.[0]?.error) throw new Error(`Vision API: ${json.responses[0].error.message}`);
-  return text;
-}
 
 function extractNumbers(text) {
   const matches = text.match(/\b\d+(?:[\.,]\d+)?\b/g) ?? [];
@@ -105,6 +32,35 @@ function findMes(text, meses) {
     if (lower.includes(m.toLowerCase())) return m;
   }
   return null;
+}
+
+async function ocrTextFromBuffer(buf) {
+  const API_KEY = process.env.VISION_API_KEY;
+  if (!API_KEY) throw new Error('VISION_API_KEY no configurada');
+
+  const base64 = buf.toString('base64');
+  const body = {
+    requests: [{
+      image: { content: base64 },
+      features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
+    }],
+  };
+
+  const res = await fetch(`${VISION_URL}?key=${API_KEY}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Vision API error (${res.status}): ${err}`);
+  }
+
+  const json = await res.json();
+  const text = json.responses?.[0]?.fullTextAnnotation?.text ?? '';
+  if (json.responses?.[0]?.error) throw new Error(`Vision API: ${json.responses[0].error.message}`);
+  return text;
 }
 
 app.post(
