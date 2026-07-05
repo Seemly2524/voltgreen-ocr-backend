@@ -1,13 +1,22 @@
 import express from 'express';
 import multer from 'multer';
 import cors from 'cors';
+import Tesseract from 'tesseract.js';
 
 const app = express();
 app.use(cors());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-const VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
+async function ocrTextFromBuffer(buf) {
+  const { data } = await Tesseract.recognize(buf, 'spa', {
+    logger: (info) => {
+      if (info.status === 'recognizing text') return;
+      console.log(info);
+    },
+  });
+  return data.text;
+}
 
 function extractNumbers(text) {
   const matches = text.match(/\b\d+(?:[\.,]\d+)?\b/g) ?? [];
@@ -32,35 +41,6 @@ function findMes(text, meses) {
     if (lower.includes(m.toLowerCase())) return m;
   }
   return null;
-}
-
-async function ocrTextFromBuffer(buf) {
-  const API_KEY = process.env.VISION_API_KEY;
-  if (!API_KEY) throw new Error('VISION_API_KEY no configurada');
-
-  const base64 = buf.toString('base64');
-  const body = {
-    requests: [{
-      image: { content: base64 },
-      features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
-    }],
-  };
-
-  const res = await fetch(`${VISION_URL}?key=${API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Vision API error (${res.status}): ${err}`);
-  }
-
-  const json = await res.json();
-  const text = json.responses?.[0]?.fullTextAnnotation?.text ?? '';
-  if (json.responses?.[0]?.error) throw new Error(`Vision API: ${json.responses[0].error.message}`);
-  return text;
 }
 
 app.post(
@@ -111,7 +91,7 @@ app.post(
         mesRecibo: mesRecibo ?? null,
         consumosMensualesKwh: consumos,
         ...(!tarifa || !mesRecibo || consumos.length < 12
-          ? { error: 'No se pudieron inferir todos los campos con alta confianza' }
+          ? { error: 'No se pudieron inferir todos los campos' }
           : {}),
       });
     } catch (e) {
