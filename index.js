@@ -1,14 +1,31 @@
 import express from 'express';
 import multer from 'multer';
 import cors from 'cors';
+import { ImageAnnotatorClient } from '@google-cloud/vision';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(cors());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-const API_KEY = process.env.VISION_API_KEY;
-const VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
+// Usar cuenta de servicio desde variable de entorno GOOGLE_CREDENTIALS_JSON
+const credsJson = process.env.GOOGLE_CREDENTIALS_JSON;
+if (credsJson) {
+  const tmpPath = path.join(__dirname, 'tmp-credentials.json');
+  fs.writeFileSync(tmpPath, credsJson);
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = tmpPath;
+}
+
+let visionClient;
+try {
+  visionClient = new ImageAnnotatorClient();
+} catch (e) {
+  console.warn('Vision client no inicializado, usando API key como fallback');
+}
 
 function extractNumbers(text) {
   const matches = text.match(/\b\d+(?:[\.,]\d+)?\b/g) ?? [];
@@ -36,6 +53,15 @@ function findMes(text, meses) {
 }
 
 async function ocrTextFromBuffer(buf) {
+  if (visionClient) {
+    const [result] = await visionClient.documentTextDetection(buf);
+    const text = result.fullTextAnnotation?.text ?? '';
+    if (result.error) throw new Error(`Vision API: ${result.error.message}`);
+    return text;
+  }
+
+  // Fallback a API key si no hay cuenta de servicio
+  const API_KEY = process.env.VISION_API_KEY;
   if (!API_KEY) throw new Error('VISION_API_KEY no configurada');
 
   const base64 = buf.toString('base64');
@@ -46,7 +72,7 @@ async function ocrTextFromBuffer(buf) {
     }],
   };
 
-  const res = await fetch(`${VISION_URL}?key=${API_KEY}`, {
+  const res = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${API_KEY}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -59,12 +85,7 @@ async function ocrTextFromBuffer(buf) {
 
   const json = await res.json();
   const text = json.responses?.[0]?.fullTextAnnotation?.text ?? '';
-
-  // Si la API devuelve error en la respuesta
-  if (json.responses?.[0]?.error) {
-    throw new Error(`Vision API: ${json.responses[0].error.message}`);
-  }
-
+  if (json.responses?.[0]?.error) throw new Error(`Vision API: ${json.responses[0].error.message}`);
   return text;
 }
 
