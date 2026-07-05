@@ -1,30 +1,85 @@
 import express from 'express';
 import multer from 'multer';
 import cors from 'cors';
-import { ImageAnnotatorClient } from '@google-cloud/vision';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { GoogleAuth } from 'google-auth-library';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(cors());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Usar cuenta de servicio desde variable de entorno GOOGLE_CREDENTIALS_JSON
-const credsJson = process.env.GOOGLE_CREDENTIALS_JSON;
-if (credsJson) {
-  const tmpPath = path.join(__dirname, 'tmp-credentials.json');
-  fs.writeFileSync(tmpPath, credsJson);
-  process.env.GOOGLE_APPLICATION_CREDENTIALS = tmpPath;
+const VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
+
+let getAccessToken;
+
+async function initAuth() {
+  const credsJson = process.env.GOOGLE_CREDENTIALS_JSON;
+  if (credsJson) {
+    try {
+      const creds = JSON.parse(credsJson);
+      const auth = new GoogleAuth({
+        credentials: creds,
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+      });
+      const client = await auth.getClient();
+      getAccessToken = async () => {
+        const token = await client.getAccessToken();
+        return token.token;
+      };
+      console.log('Autenticado con cuenta de servicio');
+      return;
+    } catch (e) {
+      console.error('Error al inicializar auth:', e.message);
+    }
+  }
+
+  const API_KEY = process.env.VISION_API_KEY;
+  if (API_KEY) {
+    getAccessToken = async () => null;
+    console.log('Usando API key como respaldo');
+    return;
+  }
+
+  throw new Error('No hay credenciales configuradas (GOOGLE_CREDENTIALS_JSON o VISION_API_KEY)');
 }
 
-let visionClient;
-try {
-  visionClient = new ImageAnnotatorClient();
-} catch (e) {
-  console.warn('Vision client no inicializado, usando API key como fallback');
+await initAuth();
+
+async function ocrTextFromBuffer(buf) {
+  const base64 = buf.toString('base64');
+  const body = {
+    requests: [{
+      image: { content: base64 },
+      features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
+    }],
+  };
+
+  const token = await getAccessToken();
+  const headers = { 'Content-Type': 'application/json' };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+    var url = VISION_URL;
+  } else {
+    const API_KEY = process.env.VISION_API_KEY;
+    url = `${VISION_URL}?key=${API_KEY}`;
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Vision API error (${res.status}): ${err}`);
+  }
+
+  const json = await res.json();
+  const text = json.responses?.[0]?.fullTextAnnotation?.text ?? '';
+  if (json.responses?.[0]?.error) throw new Error(`Vision API: ${json.responses[0].error.message}`);
+  return text;
 }
 
 function extractNumbers(text) {
@@ -52,45 +107,6 @@ function findMes(text, meses) {
   return null;
 }
 
-async function ocrTextFromBuffer(buf) {
-  if (visionClient) {
-    const [result] = await visionClient.documentTextDetection(buf);
-    const text = result.fullTextAnnotation?.text ?? '';
-    if (result.error) throw new Error(`Vision API: ${result.error.message}`);
-    return text;
-  }
-
-  // Fallback a API key si no hay cuenta de servicio
-  const API_KEY = process.env.VISION_API_KEY;
-  if (!API_KEY) throw new Error('VISION_API_KEY no configurada');
-
-  const base64 = buf.toString('base64');
-  const body = {
-    requests: [{
-      image: { content: base64 },
-      features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
-    }],
-  };
-
-  const res = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Vision API error (${res.status}): ${err}`);
-  }
-
-  const json = await res.json();
-  const text = json.responses?.[0]?.fullTextAnnotation?.text ?? '';
-  if (json.responses?.[0]?.error) throw new Error(`Vision API: ${json.responses[0].error.message}`);
-  return text;
-}
-
-// POST /ocr
-// body multipart/form-data con campos: headerImage (foto 1) y consumptionImage (foto 2)
 app.post(
   '/ocr',
   upload.fields([
@@ -106,46 +122,24 @@ app.post(
         return res.status(400).json({ error: 'Faltan imágenes: headerImage y/o consumptionImage' });
       }
 
-      // Supuestos (de tu UI)
       const tarifasCfe = [
-        '1',
-        '1A',
-        '1B',
-        '1C',
-        '1D',
-        '1E',
-        '1F',
+        '1', '1A', '1B', '1C', '1D', '1E', '1F',
         'DAC (Doméstica de Alto Consumo)',
       ];
       const meses = [
-        'Enero',
-        'Febrero',
-        'Marzo',
-        'Abril',
-        'Mayo',
-        'Junio',
-        'Julio',
-        'Agosto',
-        'Septiembre',
-        'Octubre',
-        'Noviembre',
-        'Diciembre',
+        'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+        'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre',
       ];
 
-      // OCR
-      const headerText = await ocrTextFromBuffer(header.buffer);
-      const consumptionText = await ocrTextFromBuffer(consumption.buffer);
+      const [headerText, consumptionText] = await Promise.all([
+        ocrTextFromBuffer(header.buffer),
+        ocrTextFromBuffer(consumption.buffer),
+      ]);
 
-      // Extraer tarifa/mes desde la foto de encabezado
       const tarifa = findTarifa(headerText, tarifasCfe);
       const mesRecibo = findMes(headerText, meses);
 
-      // Extraer kWh desde la foto de consumo
-      // Estrategia: buscar patrones tipo "xxx kWh" o números con decimales.
-      // Esto reduce el riesgo de tomar fechas/valores irrelevantes.
       const nums = extractNumbers(consumptionText);
-
-      // Intento adicional con regex directa para kWh
       const kwhMatches = (consumptionText.match(/\b\d+(?:[\.,]\d+)?\b\s*k\s*wh\b/gi) ?? [])
         .map((s) => {
           const n = s.match(/\b\d+(?:[\.,]\d+)?\b/);
@@ -154,27 +148,15 @@ app.post(
         })
         .filter((n) => Number.isFinite(n));
 
-      // Si encontramos kWh explícitos, usamos esos; si no, fallback a los primeros números.
       const consumos = (kwhMatches.length >= 12 ? kwhMatches : nums).slice(0, 12);
 
-
-      if (!tarifa || !mesRecibo || consumos.length < 12) {
-        return res.status(200).json({
-          error: 'No se pudieron inferir todos los campos con alta confianza',
-          tarifa: tarifa ?? null,
-          mesRecibo: mesRecibo ?? null,
-          consumosMensualesKwh: consumos,
-        });
-      }
-
       return res.status(200).json({
-        tarifa,
-        mesRecibo,
+        tarifa: tarifa ?? null,
+        mesRecibo: mesRecibo ?? null,
         consumosMensualesKwh: consumos,
-        debug: {
-          headerTextSample: headerText.slice(0, 500),
-          consumptionTextSample: consumptionText.slice(0, 500),
-        },
+        ...(!tarifa || !mesRecibo || consumos.length < 12
+          ? { error: 'No se pudieron inferir todos los campos con alta confianza' }
+          : {}),
       });
     } catch (e) {
       console.error(e);
@@ -187,5 +169,3 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`OCR API listening on http://0.0.0.0:${PORT}`);
 });
-
-
